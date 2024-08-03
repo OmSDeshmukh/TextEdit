@@ -1,5 +1,8 @@
-kilo: app.c
-	$(CC) app.c -o app -Wall -Wextra -pedantic -std=c99
+all: app
+	./bin/app
+
+app: app.c
+	$(CC) app.c -o ./bin/app -Wall -Wextra -pedantic -std=c99
 
 clean: 
-	rm app
+	rm ./bin/app
