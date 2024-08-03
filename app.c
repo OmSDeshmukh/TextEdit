@@ -11,7 +11,7 @@
 
 /*** Defines ***/
 #define CTRL_KEY(k) ((k) & 0x1f) // Macro to mimic ctrl key from the keyboard
-
+#define EDITOR_VERSION "0.0.1"
 
 
 /*** Data ***/
@@ -25,9 +25,26 @@ struct editorConfig {
     int screenrows;
     int screencols;
 
+    // measuments of the curser
+    int cx; // which column
+    int cy; // which row
+
 } typedef editorConfig;
 
 editorConfig E;
+
+// all those keys with more than 1byte escape sequences
+enum editorKey {
+  ARROW_LEFT = 1000,
+  ARROW_RIGHT,
+  ARROW_UP,
+  ARROW_DOWN,
+  DEL_KEY,
+  HOME_KEY,
+  END_KEY,
+  PAGE_UP,
+  PAGE_DOWN
+};
 
 
 /*** Terminal ***/
@@ -79,22 +96,71 @@ void enableRawMode()
 }
 
 // A function for reading the key presses and return the characters pressed
-char editorReadKey()
+int editorReadKey()
 {
     int nread;
 
     char c;
-    if(read(STDIN_FILENO, &c, 1) == -1 && errno != EAGAIN)
-        die("read");
+    while ((nread = read(STDIN_FILENO, &c, 1)) != 1) 
+        if (nread == -1 && errno != EAGAIN) die("read");
     
+    // when the read characters are escape sequences
+    if(c=='\x1b')
+    {
+        char seq[3];
+
+        // if nothing after that, return the escape seq only
+        if (read(STDIN_FILENO, &seq[0], 1) != 1) 
+            return '\x1b';
+        if (read(STDIN_FILENO, &seq[1], 1) != 1) 
+            return '\x1b';
         
-    // if(iscntrl(c))
-    //     printf("%d\r\n",c);
-    // else
-    //     printf("%d (%c)\r\n",c,c);
-
-    return c;
-
+        if (seq[0] == '[') 
+        {
+            if (seq[1] >= '0' && seq[1] <= '9') 
+            {
+                if (read(STDIN_FILENO, &seq[2], 1) != 1) 
+                    return '\x1b';
+                if (seq[2] == '~') 
+                {
+                    switch (seq[1])
+                    {
+                        case '1': return HOME_KEY;
+                        case '3': return DEL_KEY;
+                        case '4': return END_KEY;
+                        case '5': return PAGE_UP;
+                        case '6': return PAGE_DOWN;
+                        case '7': return HOME_KEY;
+                        case '8': return END_KEY;
+                    }
+                }
+            } 
+            else 
+            {
+                switch (seq[1]) 
+                {
+                    case 'A': return ARROW_UP;
+                    case 'B': return ARROW_DOWN;
+                    case 'C': return ARROW_RIGHT;
+                    case 'D': return ARROW_LEFT;
+                    case 'H': return HOME_KEY;
+                    case 'F': return END_KEY;
+                }
+            }
+        } 
+        else if (seq[0] == 'O')     
+        {
+            switch (seq[1]) 
+            {
+                case 'H': return HOME_KEY;
+                case 'F': return END_KEY;
+            }
+        }
+        return '\x1b';
+    }
+    // when read characters are usual characters
+    else
+        return c;
 }
 
 // to get the cursor position
@@ -192,20 +258,70 @@ void abFree(abuf *ab)
 
 /*** Input/Keypress handling ***/
 
+// Function for cursor movement handling
+void editorMoveCursor(int key) 
+{
+    switch (key) 
+    {
+        case ARROW_LEFT:
+            if (E.cx != 0) {
+                E.cx--;
+            }
+            break;
+        case ARROW_RIGHT:
+            if (E.cx != E.screencols - 1) {
+                E.cx++;
+            }
+            break;
+        case ARROW_UP:
+            if (E.cy != 0) {
+                E.cy--;
+            }
+            break;
+        case ARROW_DOWN:
+            if (E.cy != E.screenrows - 1) {
+                E.cy++;
+            }
+            break;
+    }
+}
+
+
 // A function to process the keys pressed on the keyboard
 void editorProcessKeypress()
 {
-    char c = editorReadKey();
+    int c = editorReadKey();
 
     switch (c)
     {
-    case CTRL_KEY('q'):
-        write(STDOUT_FILENO,"\x1b[2J",4);
-        write(STDOUT_FILENO,"\x1b[H",3);
-        exit(0);
-    
-    default:
-        break;
+        case CTRL_KEY('q'):
+            write(STDOUT_FILENO,"\x1b[2J",4);
+            write(STDOUT_FILENO,"\x1b[H",3);
+            exit(0);
+            break;
+
+        case ARROW_UP:
+        case ARROW_DOWN:
+        case ARROW_LEFT:
+        case ARROW_RIGHT:
+            editorMoveCursor(c);
+            break;
+
+        case PAGE_UP:
+        case PAGE_DOWN:
+            {
+                int times = E.screenrows;
+                while (times--)
+                editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+            }
+            break;
+
+        case HOME_KEY:
+            E.cx = 0;
+            break;
+        case END_KEY:
+            E.cx = E.screencols - 1;
+            break;
     }
 }
 
@@ -213,32 +329,66 @@ void editorProcessKeypress()
 /*** Output ***/
 
 // To mark each row in our editor
-void editorDrawRows()
+void editorDrawRows(abuf *ab)
 {
     for(int i=0;i<E.screenrows;i++)
     {
-        write(STDOUT_FILENO,"~",1);
+        // Display the welcome message
+        if(i==E.screenrows/3)
+        {
+            char welcome[80];
+            int welcomelen = snprintf(welcome, sizeof(welcome),
+                "Text editor -- version %s", EDITOR_VERSION);
+            if (welcomelen > E.screencols) 
+                welcomelen = E.screencols;
+
+            // centring
+            int padding = (E.screencols - welcomelen)/2;
+            if(padding)
+            {
+                abAppend(ab,"~",1);
+                padding--;
+            }
+            while(padding--)
+                abAppend(ab," ",1);
+
+
+            abAppend(ab, welcome, welcomelen);
+        }
+        else
+            abAppend(ab,"~",1);
+ 
+        // escape sequence to clear a line
+        abAppend(ab, "\x1b[K", 3);
 
         if(i<E.screenrows-1)
-            write(STDOUT_FILENO,"\r\n",2);
+            abAppend(ab,"\r\n",2);
     }
-    printf("%d",E.screenrows);
-        
 }
+
 
 
 // To clear screen and put cursor at the start of the editor
 void editorRefreshScreen()
 {
-    // writing the escape sequence for clearing the entire screen 
-    write(STDOUT_FILENO,"\x1b[2J",4);
+    abuf ab = ABUF_INIT;
 
-    // moving the cursor to the top left
-    write(STDOUT_FILENO,"\x1b[H",3);
+    // escape sequence for hiding the cursor
+    abAppend(&ab, "\x1b[?25l", 6);
+    // moving the cursor to the top left so that tilde can be printed correctly from start
+    abAppend(&ab,"\x1b[H",3);
 
-    editorDrawRows();
+    editorDrawRows(&ab);
 
-    write(STDOUT_FILENO,"\x1b[H",3);
+    // Displaying the cursor at the required location
+    char buff[24];
+    snprintf(buff,sizeof(buff),"\x1b[%d;%dH",E.cy+1, E.cx + 1);
+    abAppend(&ab, buff, strlen(buff));
+
+
+    abAppend(&ab, "\x1b[?25h", 6);
+    write(STDOUT_FILENO,ab.b,ab.len);
+    abFree(&ab);
 }
 
 
@@ -247,6 +397,8 @@ void editorRefreshScreen()
 // initialise all the fields of our editor
 void initEditor()
 {
+    E.cx = 0;
+    E.cy = 0;
     if(getWindowSize(&E.screenrows,&E.screencols) == -1)
         die("getWindowSize");
 }
