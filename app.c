@@ -7,14 +7,23 @@
 #include <ctype.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
 #include <string.h>
 
 /*** Defines ***/
 #define CTRL_KEY(k) ((k) & 0x1f) // Macro to mimic ctrl key from the keyboard
 #define EDITOR_VERSION "0.0.1"
-
+#define _DEFAULT_SOURCE
+#define _GNU_SOURCE
+#define _BSD_SOURCE
 
 /*** Data ***/
+
+// A structure to store the text present in the editor 
+typedef struct erow{
+    int size;
+    char* chars;
+} erow;
 
 // A global variable for storing state of our editor
 struct editorConfig {
@@ -29,6 +38,11 @@ struct editorConfig {
     int cx; // which column
     int cy; // which row
 
+    int numrows; // number of rows with text in current file
+    erow *row; // array of row data
+
+    int rowoff; // row offset for scrolling
+    int coloff; // column offset for horizontal scrolling
 } typedef editorConfig;
 
 editorConfig E;
@@ -223,6 +237,41 @@ int getWindowSize(int *rows, int* cols)
 }
 
 
+/*** file I/O ***/
+
+void editorAppendRow(char *s, size_t len) 
+{
+    E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
+    int at = E.numrows;
+    E.row[at].size = len;
+    E.row[at].chars = malloc(len + 1);
+    memcpy(E.row[at].chars, s, len);
+    E.row[at].chars[len] = '\0';
+    E.numrows++;
+}
+
+void editorOpen(char* filename)
+{
+    // reading input from a file
+    FILE *fp = fopen(filename, "r");
+    if(!(fp))
+        die("fopen"); // error message
+
+    char* line = NULL;
+    size_t linecap = 0;
+    ssize_t linelen;
+    
+    while ((linelen = getline(&line, &linecap, fp)) != -1)
+    {
+        while(linelen > 0 && (line[linelen-1]=='\n' || line[linelen-1]=='\r'))
+            linelen--;
+        editorAppendRow(line, linelen);
+    }
+    free(line);
+    fclose(fp);
+}
+
+
 /*** Append Buffer ***/
 // Kind of like a dynamic buffer
 
@@ -261,6 +310,7 @@ void abFree(abuf *ab)
 // Function for cursor movement handling
 void editorMoveCursor(int key) 
 {
+    erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
     switch (key) 
     {
         case ARROW_LEFT:
@@ -269,7 +319,8 @@ void editorMoveCursor(int key)
             }
             break;
         case ARROW_RIGHT:
-            if (E.cx != E.screencols - 1) {
+            // We dont let cursor move past last character in respective row
+            if (row && E.cx < row->size) {
                 E.cx++;
             }
             break;
@@ -279,7 +330,7 @@ void editorMoveCursor(int key)
             }
             break;
         case ARROW_DOWN:
-            if (E.cy != E.screenrows - 1) {
+            if (E.cy < E.numrows) {
                 E.cy++;
             }
             break;
@@ -328,36 +379,68 @@ void editorProcessKeypress()
 
 /*** Output ***/
 
+void editorScroll() 
+{
+    if (E.cy < E.rowoff) {
+        E.rowoff = E.cy;
+    }
+    if (E.cy >= E.rowoff + E.screenrows) {
+        E.rowoff = E.cy - E.screenrows + 1;
+    }
+    if (E.cx < E.coloff) {
+        E.coloff = E.cx;
+    }
+    if (E.cx >= E.coloff + E.screencols) {
+        E.coloff = E.cx - E.screencols + 1;
+    }
+}
+
 // To mark each row in our editor
 void editorDrawRows(abuf *ab)
 {
     for(int i=0;i<E.screenrows;i++)
     {
-        // Display the welcome message
-        if(i==E.screenrows/3)
+        int filerow = i + E.rowoff;
+        if(filerow>=E.numrows)
         {
-            char welcome[80];
-            int welcomelen = snprintf(welcome, sizeof(welcome),
-                "Text editor -- version %s", EDITOR_VERSION);
-            if (welcomelen > E.screencols) 
-                welcomelen = E.screencols;
-
-            // centring
-            int padding = (E.screencols - welcomelen)/2;
-            if(padding)
+            // Display the welcome message
+            if(E.numrows==0 && i==E.screenrows/3)
             {
-                abAppend(ab,"~",1);
-                padding--;
+                char welcome[80];
+                int welcomelen = snprintf(welcome, sizeof(welcome),
+                    "Text editor -- version %s", EDITOR_VERSION);
+                if (welcomelen > E.screencols) 
+                    welcomelen = E.screencols;
+
+                // centring
+                int padding = (E.screencols - welcomelen)/2;
+                if(padding)
+                {
+                    abAppend(ab,"~",1);
+                    padding--;
+                }
+                while(padding--)
+                    abAppend(ab," ",1);
+
+
+                abAppend(ab, welcome, welcomelen);
             }
-            while(padding--)
-                abAppend(ab," ",1);
-
-
-            abAppend(ab, welcome, welcomelen);
+            else
+                abAppend(ab,"~",1);
         }
         else
-            abAppend(ab,"~",1);
- 
+        {
+            int len = E.row[filerow].size - E.coloff;
+
+            if(len < 0)
+                len = 0;
+
+            // Displaying only what is possible
+            if(len > E.screencols)
+                len = E.screencols;
+
+            abAppend(ab, &E.row[filerow].chars[E.coloff], len);
+        }
         // escape sequence to clear a line
         abAppend(ab, "\x1b[K", 3);
 
@@ -371,6 +454,7 @@ void editorDrawRows(abuf *ab)
 // To clear screen and put cursor at the start of the editor
 void editorRefreshScreen()
 {
+    editorScroll();
     abuf ab = ABUF_INIT;
 
     // escape sequence for hiding the cursor
@@ -382,7 +466,7 @@ void editorRefreshScreen()
 
     // Displaying the cursor at the required location
     char buff[24];
-    snprintf(buff,sizeof(buff),"\x1b[%d;%dH",E.cy+1, E.cx + 1);
+    snprintf(buff,sizeof(buff),"\x1b[%d;%dH",E.cy - E.rowoff + 1, E.cx - E.coloff + 1);
     abAppend(&ab, buff, strlen(buff));
 
 
@@ -399,15 +483,25 @@ void initEditor()
 {
     E.cx = 0;
     E.cy = 0;
+    E.numrows = 0;
+    E.row = NULL;
+    E.rowoff = 0;
+    E.coloff = 0;
+
+
     if(getWindowSize(&E.screenrows,&E.screencols) == -1)
         die("getWindowSize");
+    
 }
 
 
-int main()
+int main(int argc, char* argv[])
 {
     enableRawMode();
     initEditor();
+
+    if(argc >= 2)
+        editorOpen(argv[1]);
 
     // reading text input in the termial 1 byte at a time
     // stdin by default it the shell/terminal
